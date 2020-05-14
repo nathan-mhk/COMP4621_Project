@@ -3,6 +3,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <pthread.h>
+#include <netdb.h>
 
 #define MAXLINE 1000
 #define SERVER_PORT 12345
@@ -18,6 +20,9 @@ void* process(void* args) {
 
     char last4chars[HTTP_HEADER_LAST_CHAR_NUM + 1] = {0};
     char* terminator = "\r\n\r\n";
+
+    char host[MAXLINE] = {0};
+    struct hostent *target;
 
     // Grab the HTTP/HTTPS request
     int connfd = (int)args;
@@ -43,6 +48,8 @@ void* process(void* args) {
         }
     }
     recv[i] = '\0';
+    
+    printf("%s", recv);
 
     // recv contains the request
     if (recv[0] == 'G') {
@@ -77,20 +84,85 @@ void* process(void* args) {
         }
 
         // Find j which the relative URL begins
-        for (j, k; j < MAXLINE;) {
+        for (int x = 0, j, k; j < MAXLINE;) {
             if (recv[j] == recv[k]) {
+
+                host[x] = recv[k];
+
                 ++j;
                 ++k;
             } else {
                 break;
             }
         }
+        
+        /**
+         * Remove "Proxy-"
+         * k == 'P' or 'C'
+         */
+        for (j; j < (k + 2); ++j) {
+            request[i] = recv[j];
+        }
+
+        // j == 'P' or 'C'
+        if (recv[j] == 'P') {
+            j += 6;
+        }
 
         for (j; j < MAXLINE; ++j) {
             request[i] = recv[j];
         }
 
-        // request[] now contains the modified proxy message
+        printf("%s", request);
+
+        // request[] now contains the modified request
+        int sockfd, n;
+        struct sockaddr_in targetAddr;
+        char writeline[MAXLINE] = {0};
+        char response[MAXLINE] = {0};
+
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd < 0) {
+            printf("Error: init socket\n");
+            return;
+        }
+
+        target = gethostbyname(host);
+        if (target = NULL) {
+            printf("Error: Hose not found\n");
+            return;
+        }
+
+        memset(&targetAddr, 0, sizeof(targetAddr));
+        targetAddr.sin_family = AF_INET;
+        targetAddr.sin_port = htons(80);
+        memcpy(&targetAddr.sin_addr.s_addr, target->h_addr, target->h_length);
+
+        if (connect(sockfd, (struct sockaddr *)&targetAddr, sizeof(targetAddr)) < 0) {
+            printf("Error: Error connecting");
+        }
+
+        snprintf(writeline, sizeof(writeline) - 1, request);
+        write(sockfd, writeline, strlen(writeline));
+
+        while (1) {
+            n = read(sockfd, response, (sizeof(response) - 1));
+
+            if (n <= 0) {
+                break;
+            }
+        }
+        response[n] = 0;
+
+        // Send response
+        int bytesWritten = 0;
+        int totalBWritten = strlen(response);
+
+        while (bytesWritten < totalBWritten) {
+            bytesWritten += write(connfd, (response + bytesWritten), (totalBWritten - bytesWritten));
+        }
+
+        // close(connfd);
 
     } else {
         /**
