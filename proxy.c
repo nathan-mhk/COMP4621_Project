@@ -12,7 +12,7 @@
 #define SERVER_PORT 12345
 #define LISTENNQ 5
 #define HTTP_HEADER_LAST_CHAR_NUM 4
-#define MAXTHREAD (5)
+#define MAXTHREAD (10)
 #define BLOCK_LIST_SIZE 10
 #define CACHE_LIST_SIZE 512
 #define URL_LENGTH 50
@@ -169,7 +169,7 @@ long getContentLength(char* msg, int* found) {
     char buff[strlength];
 
     int i = 0, j = 0;
-    while (1) {
+    while (i < strlen(msg)) {
         if (msg[i++] != '\n') {
             continue;
         }
@@ -191,7 +191,7 @@ long getContentLength(char* msg, int* found) {
             memcpy(temp, &msg[i], (size - 1));
             temp[size] = '\0';
             contentlen = strtol(temp, &str, 10);
-            printf("Content length: %ld\n", contentlen);
+            printf("Content length: %ld\n", contentlen);    // REMOVEME
             break;
         }
     }
@@ -244,7 +244,6 @@ int sentRequest(char* host, char* absURL, char* request) {
         }
 
         if (connect(sockfd, current->ai_addr, current->ai_addrlen) != -1) {
-            printf("Host socket successfully connected\n");     // REMOVEME
             break;
         }
         close(sockfd);
@@ -286,17 +285,16 @@ int sentRequest(char* host, char* absURL, char* request) {
                 printf("Remaining Content Length: %ld\n", remainContentLen);
             }
             // Write the response to file
-            printf("**********\n%s**********\n", response);
-            printf("Writing response to file (%d)\n", i++);
+            printf("**********\n%s**********\nWriting response to file (%d)\n", response, i++);     // REMOVEME
             fprintf(fp, response);
+            fflush(fp);
         }
     }
-    printf("Response read from host\n");   // REMOVEME
 
     fprintf(cache, "%s\n", absURL);
-
-    printf("Requested URL is now stored in cache\n");      // REMOVEME
     
+    printf("Response read from host and stored in cache\n");   // REMOVEME
+
     fclose(fp);
     fclose(cache);
 
@@ -322,7 +320,7 @@ void sendResponse(char* absURL, int* connfd, int blocked) {
         char fbuff[ABS_URL_BUFF_LENGTH];
         size_t bytesRead = 0;
 
-        snprintf(fbuff, sizeof(fbuff), "%s.html", absURL);  // FIXME
+        snprintf(fbuff, sizeof(fbuff), "%s.html", absURL);
         FILE* fp = fopen(fbuff, "r");
 
         if (fp == NULL) {
@@ -344,10 +342,111 @@ void sendResponse(char* absURL, int* connfd, int blocked) {
         }
     }
 
-    printf("Response sent back to client\n");  // REMOVEME
-
     close(*connfd);
-    printf("Client connection closed\n");  // REMOVEME
+}
+
+void* handle(void* args) {
+    int connfd = (int) args;
+
+    char blockList[BLOCK_LIST_SIZE][URL_LENGTH];
+    char cacheList[CACHE_LIST_SIZE][ABS_URL_LENGTH];
+
+    int numBlockedItms = getBlockList(blockList);
+    int numCachedItms = getCacheList(cacheList);
+
+    char buff = 0;
+    char recv[MAXLINE] = {0};
+    char request[MAXLINE] = {0};
+
+    char host[MAXLINE] = {0};
+    char absURL[ABS_URL_LENGTH] = {0};
+
+    char last4chars[HTTP_HEADER_LAST_CHAR_NUM + 1] = {0};
+    char* terminator = "\r\n\r\n";
+
+    // Grab the HTTP/HTTPS request
+    int i = 0;
+    int n;
+    while (i < sizeof(recv)) {
+        n = read(connfd, &buff, sizeof(buff));
+
+        if (n <= 0) {
+            break;
+        }
+
+        recv[i++] = buff;
+
+        int j;
+        for (j = 0; j < HTTP_HEADER_LAST_CHAR_NUM; ++j) {
+            last4chars[j] = recv[i - HTTP_HEADER_LAST_CHAR_NUM + j];
+        }
+
+        /* HTTP header end with "\r\n\r\n" */
+        if (strcmp(last4chars, terminator) == 0) {
+            break;
+        }
+    }
+    recv[i] = '\0';
+
+    // recv contains the request
+    if (recv[0] == 'G') {
+        /**
+             * HTTP request
+             */
+
+        printf("Client HTTP request received\n");  // REMOVEME
+
+        modify(host, recv, request, absURL);
+
+        FILE* history = fopen("history.txt", "a");
+        if (history == NULL) {
+            printf("Error: Failed to create file\n");
+            return 0;
+        }
+        fprintf(history, "**********%s**********\n%s~~~~~~~~~~\n%s**********%s**********\n", absURL, recv, request, host);
+        fclose(history);
+
+        for (i = 0; i < numBlockedItms; ++i) {
+            if (strcmp(blockList[i], host) == 0) {
+                printf("Requested site is blocked\n");
+
+                sendResponse(absURL, &connfd, 1);
+                return;
+            }
+        }
+
+        for (i = 0; i < numCachedItms; ++i) {
+            if (strcmp(cacheList[i], absURL) == 0) {
+                printf("Requested URL is found in cache\n");
+
+                sendResponse(absURL, &connfd, 0);
+                return;
+            }
+        }
+
+        if (sentRequest(host, absURL, request) != 0) {
+            // Encountered error while sending request
+            return;
+        }
+
+        numCachedItms = getCacheList(cacheList);
+
+        sendResponse(absURL, &connfd, 0);
+
+    } else if (recv[0] == 'C') {
+        /**
+             * HTTPS request
+             * 
+             * CONNECT example.copm:443 HTTP/1.1\r\n
+             * Host: sample.com\r\n
+             * Connection: keep-alive\r\n
+             * 
+             * Check P.10 for info
+             */
+        // printf("Client HTTPS request received\n");  // REMOVEME
+
+        close(connfd);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -359,19 +458,11 @@ int main(int argc, char** argv) {
     int threads_count = 0;
     pthread_t threads[MAXTHREAD];
 
-    char blockList[BLOCK_LIST_SIZE][URL_LENGTH];
-    char cacheList[CACHE_LIST_SIZE][ABS_URL_LENGTH];
-
-    int numBlockedItms = getBlockList(blockList);
-    int numCachedItms = getCacheList(cacheList);
-
     /* initialize server socket */
     listenfd = socket(AF_INET, SOCK_STREAM, 0); /* SOCK_STREAM : TCP */
     if (listenfd < 0) {
         printf("Error: init socket\n");
         return 0;
-    } else {
-        printf("Proxy server incoming socket initialized\n");    // REMOVEME
     }
 
     /* initialize server address (IP:port) */
@@ -384,15 +475,11 @@ int main(int argc, char** argv) {
     if (bind(listenfd, (struct sockaddr*)&servaddr, sizeof(struct sockaddr)) < 0) {
         printf("Error: bind\n");
         return 0;
-    } else {
-        printf("Proxy server socket bound\n");    // REMOVEME
     }
 
     if (listen(listenfd, LISTENNQ) < 0) {
         printf("Error: listen\n");
         return 0;
-    } else {
-        printf("Proxy server is now listening\n");    // REMOVEME
     }
 
     /* keep processing incoming requests */
@@ -402,110 +489,17 @@ int main(int argc, char** argv) {
         if (connfd < 0) {
             printf("Error: accept\n");
             return 0;
-        } else {
-            printf("Client connection accepted\n");   // REMOVEME
         }
 
-        char buff = 0;
-        char recv[MAXLINE] = {0};
-        char request[MAXLINE] = {0};
-
-        char host[MAXLINE] = {0};
-        char absURL[ABS_URL_LENGTH] = {0};
-
-        int cont = 0;
-
-        char last4chars[HTTP_HEADER_LAST_CHAR_NUM + 1] = {0};
-        char* terminator = "\r\n\r\n";
-
-        // Grab the HTTP/HTTPS request
-        int i = 0;
-        int n;
-        while (i < sizeof(recv)) {
-            n = read(connfd, &buff, sizeof(buff));
-
-            if (n <= 0) {
-                break;
-            }
-
-            recv[i++] = buff;
-
-            int j;
-            for (j = 0; j < HTTP_HEADER_LAST_CHAR_NUM; ++j) {
-                last4chars[j] = recv[i - HTTP_HEADER_LAST_CHAR_NUM + j];
-            }
-
-            /* HTTP header end with "\r\n\r\n" */
-            if (strcmp(last4chars, terminator) == 0) {
-                break;
+        if (threads_count >= MAXTHREAD) {
+            for (int i = 0; i < MAXTHREAD; ++i) {
+                pthread_join(threads[i], NULL);
             }
         }
-        recv[i] = '\0';
 
-        // recv contains the request
-        if (recv[0] == 'G') {
-            /**
-             * HTTP request
-             */
-            
-            printf("Client HTTP request received\n");  // REMOVEME
-
-            modify(host, recv, request, absURL);
-
-            FILE* history = fopen("history.txt", "a");
-            if (history == NULL) {
-                printf("Error: Failed to create file\n");
-                return 0;
-            }
-            fprintf(history, "**********%s**********\n%s~~~~~~~~~~\n%s**********%s**********\n", absURL, recv, request, host);
-            fclose(history);
-
-            for (i = 0; i < numBlockedItms; ++i) {
-                if (strcmp(blockList[i], host) == 0) {
-                    printf("Requested site is blocked\n");
-
-                    sendResponse(absURL, &connfd, 1);
-                    cont = 1;
-                    break;
-                }
-            }
-
-            for (i = 0; i < numCachedItms; ++i) {
-                if (strcmp(cacheList[i], absURL) == 0) {
-                    printf("Requested URL is found in cache\n");
-
-                    sendResponse(absURL, &connfd, 0);
-                    cont = 1;
-                    break;
-                }
-            }
-
-            if (cont == 1) {
-                continue;
-            }
-
-            if (sentRequest(host, absURL, request) != 0) {
-                // Encountered error while sending request
-                continue;
-            }
-            
-            numCachedItms = getCacheList(cacheList);
-
-            sendResponse(absURL, &connfd, 0);
-
-        } else if (recv[0] == 'C') {
-            /**
-             * HTTPS request
-             * 
-             * CONNECT example.copm:443 HTTP/1.1\r\n
-             * Host: sample.com\r\n
-             * Connection: keep-alive\r\n
-             * 
-             * Check P.10 for info
-             */
-            // printf("Client HTTPS request received\n");  // REMOVEME
-
-            close(connfd);
+        if (pthread_create(&threads[threads_count++], NULL, handle, (void*) connfd) != 0) {
+            printf("Error when creating thread %d\n", threads_count);
+            return 0;
         }
     }
 
