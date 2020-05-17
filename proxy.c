@@ -2,15 +2,66 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
 
-#define MAXLINE 10000
+#define MAXLINE 1024
 #define SERVER_PORT 12345
 #define LISTENNQ 5
 #define HTTP_HEADER_LAST_CHAR_NUM 4
 #define MAXTHREAD (5)
+#define BLOCK_LIST_SIZE 10
+#define CACHE_LIST_SIZE 10
+#define URL_LENGTH 50
+
+// The file should be provided from Windows, each line is terminated with \r\n
+int getBlockList(char list[BLOCK_LIST_SIZE][URL_LENGTH]) {
+    FILE* fp = fopen("Block List.txt", "r");
+
+    int i = 0;
+    while (fgets(list[i], URL_LENGTH, fp)) {
+        for (int j = (strlen(list[i]) - 2); j < URL_LENGTH; ++j) {
+            list[i][j] = '\0';
+        }
+        ++i;
+    }
+    fclose(fp);
+
+    for (int j = i; j < BLOCK_LIST_SIZE; ++j) {
+        for (int k = 0; k < URL_LENGTH; ++k) {
+            list[j][k] = '\0';
+        }
+    }
+    return --i;
+}
+
+// The file should be within linux system, each line is terminated with \n
+int getCacheList(char list[CACHE_LIST_SIZE][URL_LENGTH]) {
+    FILE* fp = fopen("Cache.txt", "r");
+
+    if (fp == NULL) {
+        // File does not exist
+        return 0;
+    }
+    int i = 0;
+    while (fgets(list[i], URL_LENGTH, fp)) {
+        for (int j = (strlen(list[i]) - 1); j < URL_LENGTH; ++j) {
+            list[i][j] = '\0';
+        }
+        ++i;
+    }
+    fclose(fp);
+    
+    for (int j = i; j < CACHE_LIST_SIZE; ++j) {
+        for (int k = 0; k < URL_LENGTH; ++k) {
+            list[j][k] = '\0';
+        }
+    }
+    return --i;
+}
 
 void modify(char* host, char* recv, char* request) {
     /**
@@ -154,14 +205,46 @@ void sentRequest(char* host, char* request, char* response) {
     printf("Response read from host\n");   // REMOVEME
 }
 
-void sendResponse(char* response, int* connfd) {
+/**
+ * Send the stored host response back to client
+ * Close the connection afterwards
+ */
+void sendResponse(char* host, int* connfd, int blocked) {
     char buffer[MAXLINE] = {0};
 
-    // Prepare send buffer
-    snprintf(buffer, (sizeof(buffer) - 1), response, *connfd);
+    if (blocked == 1) {
+        char notFound[] = "HTTP/1.1 404 Not Found\r\n\r\n";
+        
+        // Prepare send buffer
+        snprintf(buffer, (sizeof(buffer) - 1), notFound, *connfd);
     
-    // Write buffer to the connection
-    write(*connfd, buffer, strlen(buffer));
+        // Write buffer to the connection
+        write(*connfd, buffer, strlen(buffer));
+    } else {
+        char fbuff[URL_LENGTH];
+        size_t bytesRead = 0;
+
+        snprintf(fbuff, sizeof(fbuff), "%s.html", host);
+        FILE* fp = fopen(fbuff, "r");
+
+        if (fp == NULL) {
+            printf("Error: Failed to open file\n");
+        }
+
+        memset(&buffer, 0, sizeof(buffer));
+
+        while (1) {
+            bytesRead = fread(buffer, 1, (sizeof(buffer) - 1), fp);
+            
+            if (bytesRead <= 0) {
+                break;
+            }
+            
+            buffer[bytesRead] = '\0';
+
+            write(*connfd, buffer, bytesRead);
+        }
+    }
 
     printf("Response sent back to client\n");  // REMOVEME
 
@@ -175,13 +258,14 @@ int main(int argc, char** argv) {
     struct sockaddr_in servaddr, cliaddr;
     socklen_t len = sizeof(struct sockaddr_in);
 
-    char ip_str[INET_ADDRSTRLEN] = {0};
-
     int threads_count = 0;
     pthread_t threads[MAXTHREAD];
 
-    char* blockList[4] = {"www.sing.cse.ust.hk", "www.google.com", "sing.cse.ust.hk", "google.com"};
-    char notFound[] = "HTTP/1.1 404 Not Found\r\n\r\n";
+    char blockList[BLOCK_LIST_SIZE][URL_LENGTH];
+    char cacheList[CACHE_LIST_SIZE][URL_LENGTH];
+
+    int numBlockedItms = getBlockList(blockList);
+    int numCachedItms = getCacheList(cacheList);
 
     /* initialize server socket */
     listenfd = socket(AF_INET, SOCK_STREAM, 0); /* SOCK_STREAM : TCP */
@@ -227,9 +311,10 @@ int main(int argc, char** argv) {
         char buff = 0;
         char recv[MAXLINE] = {0};
         char request[MAXLINE] = {0};
-        char response[MAXLINE] = {0};
 
         char host[MAXLINE] = {0};
+
+        int cont = 0;
 
         char last4chars[HTTP_HEADER_LAST_CHAR_NUM + 1] = {0};
         char* terminator = "\r\n\r\n";
@@ -268,22 +353,49 @@ int main(int argc, char** argv) {
 
             modify(host, recv, request);
 
-            for (i = 0; i < (sizeof(blockList) / sizeof(blockList[0])); ++i) {
+            FILE* history = fopen("history.txt", "a");
+            if (history == NULL) {
+                printf("Error: Failed to create file\n");
+                return 0;
+            }
+            fprintf(history, "**********%s**********\n%s~~~~~~~~~~\n%s********************\n", host, recv, request);
+            fclose(history);
+
+            for (i = 0; i < numBlockedItms; ++i) {
                 if (strcmp(blockList[i], host) == 0) {
                     // Send 404 back to client
                     printf("Requested site is blocked\n");
 
-                    sendResponse(notFound, &connfd);
-                    continue;
+                    sendResponse(host, &connfd, 1);
+                    cont = 1;
+                    break;
                 }
             }
             // printf("%s\n*****\n%s\n*****\n%s", host, recv, request);
-            printf("\n**********\n%s", request);
+            for (i = 0; i < numCachedItms; ++i) {
+                if (strcmp(cacheList[i], host) == 0) {
+                    printf("Requested site is found in cache\n");
 
-            sentRequest(host, request, response);
+                    sendResponse(host, &connfd, 0);
+                    cont = 1;
+                    break;
+                }
+            }
 
-            sendResponse(response, &connfd);
-        } else {
+            if (cont == 1) {
+                continue;
+            }
+
+            if (sentRequest(host, request) != 0) {
+                // Encountered error while sending request
+                continue;
+            }
+            
+            numCachedItms = getCacheList(cacheList);
+
+            sendResponse(host, &connfd, 0);
+
+        } else if (recv[0] == 'C') {
             /**
              * HTTPS request
              * 
@@ -293,7 +405,7 @@ int main(int argc, char** argv) {
              * 
              * Check P.10 for info
              */
-            printf("Client HTTPS request received\n");  // REMOVEME
+            // printf("Client HTTPS request received\n");  // REMOVEME
 
             close(connfd);
         }
