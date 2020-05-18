@@ -16,7 +16,7 @@
 #define CACHE_LIST_SIZE 512
 #define URL_LENGTH 50
 #define ABS_URL_LENGTH 1024
-#define ABS_URL_BUFF_LENGTH 1029    // ABS_URL_LENGTH + ".html"
+#define ABS_URL_BUFF_LENGTH 1028    // ABS_URL_LENGTH + ".txt"
 #define BUFF_LENTH 16384
 #define SMALL_BUFF_LEN 1024
 #define PORT_LENTH 100
@@ -24,6 +24,11 @@
 struct sdPair {
     int sourcefd;
     int destinfd;
+};
+
+struct response {
+    struct sdPair sd;
+    char absURL[ABS_URL_BUFF_LENGTH];
 };
 
 // The file should be provided from Windows, each line is terminated with \r\n
@@ -281,77 +286,147 @@ long getContentLength(char* msg, int* found) {
     return contentlen;
 }
 
+// Keep forwarding bytes from source fd to destination fd
+void* tunnel(void* args) {
+    struct sdPair * sd = args;
+    int sourcefd = sd->sourcefd;
+    int destinfd = sd->destinfd;
+
+    char buffer[BUFF_LENTH] = {0};
+    int bytesRead = 0;
+
+    printf("Begin tunneling\n");
+    while (1) {
+        memset(&buffer, 0, sizeof(buffer));
+
+        bytesRead = read(sourcefd, &buffer, sizeof(buffer));  // Read from source
+
+        if (bytesRead <= 0) {
+            pthread_exit(NULL);
+        }
+
+        printf("Read: Source [%d]\n", bytesRead);       // REMOVEME
+
+        write(destinfd, buffer, bytesRead);  // Write to destination
+
+        printf("Bytes written to destination\n");       // REMOVEME
+    }
+}
+
+void* receive(void* args) {
+    struct response * res = args;
+    int clientfd = res->sd.destinfd;
+    int serverfd = res->sd.sourcefd;
+    char absURL[ABS_URL_LENGTH] = {0};
+    strcpy(absURL, res->absURL);
+
+    char buff[ABS_URL_BUFF_LENGTH] = {0};
+    snprintf(buff, sizeof(buff), "%s.txt", absURL);
+
+    FILE* fp = fopen(buff, "w");
+
+    if (fp == NULL) {
+        printf("Failed to create file\n");
+        pthread_exit(NULL);
+    }
+
+    // Read server response
+    printf("Begin reading from host\n");        // REMOVEME
+
+    char buffer[BUFF_LENTH] = {0};
+    int bytesRead = 0;
+    int i = 0;      // REMOVEME
+    long remainContentLen = 1;
+    int found = 0;
+    while (1) {
+        memset(&buffer, 0, sizeof(buffer));
+
+        bytesRead = read(serverfd, buffer, (sizeof(buffer) - 1));
+
+        if ((bytesRead <= 0) || (remainContentLen <= 0)) {
+            break;
+        }
+
+        buffer[bytesRead] = '\0';
+        
+        if (found == 1) {
+            remainContentLen -= bytesRead;
+        }
+
+        if (found == 0) {
+            remainContentLen = getContentLength(buffer, &found);
+        }
+
+        printf("Writing response to file and client (%d)\n", i++);  // REMOVEME
+
+        fprintf(fp, buffer);
+        fflush(fp);
+        printf("%d Bytes written to file\n", bytesRead);        // REMOVEME
+
+        write(clientfd, buffer, bytesRead);
+        printf("%d Bytes written to client\n", bytesRead);        // REMOVEME
+    }
+
+    fclose(fp);
+
+    pthread_exit(NULL);
+}
+
 /**
  * Send the HTTP request to host
  * Store the host response into cache and cache list
  */
-int sendRequest(char* host, char* absURL, char* request, int* clientfd) {
-    int serverfd;
-
+int handleForwarding(char* host, char* absURL, char* request, int* clientfd) {
     // Create a file for host response and open a file for storing cache
-    char buff[ABS_URL_BUFF_LENGTH] = {0};
-    snprintf(buff, sizeof(buff), "%s.html", absURL);
-
-    FILE* fp = fopen(buff, "w");
     FILE* cache = fopen("Cache.txt", "a");
 
-    if ((fp == NULL) || (cache == NULL)) {
+    if (cache == NULL) {
         printf("Error: Failed to create file\n");
         return -1;
     }
 
+    int serverfd;
     if (connectHost(host, &serverfd, "80") != 0) {
         return -2;
     }
 
     char buffer[BUFF_LENTH] = {0};
-    size_t bytesRead = 0;
 
-    // Construct the request
     snprintf(buffer, sizeof(buffer), request);
-    // Send the request
     write(serverfd, buffer, strlen(buffer));
 
-    printf("Request sent to host\n");   // REMOVEME
+    printf("Request sent to host\n");       // REMOVEME
 
-    // Read the response
-    int i = 0;
-    long remainContentLen = 1;
-    int found = 0;
-    while (1) {
-        
-        memset(&buffer, 0, sizeof(buffer));
+    struct sdPair forward;
+    forward.sourcefd = *clientfd;
+    forward.destinfd = serverfd;
+    pthread_t clientToServer;
 
-        bytesRead = read(serverfd, buffer, (sizeof(buffer) - 1));
-
-        if ((bytesRead <= 0) || (remainContentLen <= 0)) {   // EOF
-            break;
-        } else {
-            buffer[bytesRead] = '\0';
-
-            if (found == 0) {
-                remainContentLen = getContentLength(buffer, &found);
-            }
-
-            if (found == 1) {
-                remainContentLen -= bytesRead;
-                // printf("Remaining Content Length: %ld\n", remainContentLen);
-            }
-            // Write the response to file
-            printf("Writing response to file and client (%d)\n", i++);     // REMOVEME
-            
-            fprintf(fp, buffer);
-
-            write(*clientfd, buffer, bytesRead);
-        }
+    struct response backward;
+    backward.sd.sourcefd = serverfd;
+    backward.sd.destinfd = *clientfd;
+    strcpy(backward.absURL, absURL);
+    pthread_t serverToClient;
+    
+    if (pthread_create(&clientToServer, NULL, tunnel, (void*) &forward) != 0) {
+        printf("Failed to create forward http thread\n");
+        return -3;
     }
 
-    // fprintf(cache, "%s\n", absURL);      // Comment this line to disable caching
-    
-    fclose(fp);
+    if (pthread_create(&serverToClient, NULL, receive, (void*) &backward) != 0) {
+        printf("Failed to create backward http thread\n");
+        pthread_join(clientToServer, NULL);
+        return -4;
+    }
+
+    pthread_join(clientToServer, NULL);
+    pthread_join(serverToClient, NULL);
+
+    fprintf(cache, "%s\n", absURL);      // Comment this line to disable caching
     fclose(cache);
 
     close(*clientfd);
+    close(serverfd);
     printf("Response read from host and stored in cache, connection is now closed\n");   // REMOVEME
 
     return 0;
@@ -375,9 +450,9 @@ void sendResponse(char* absURL, int* clientfd, int blocked) {
     } else {
         char buffer[BUFF_LENTH] = {0};
         char fbuff[ABS_URL_BUFF_LENGTH];
-        size_t bytesRead = 0;
+        int bytesRead = 0;
 
-        snprintf(fbuff, sizeof(fbuff), "%s.html", absURL);
+        snprintf(fbuff, sizeof(fbuff), "%s.txt", absURL);
         FILE* fp = fopen(fbuff, "r");
 
         if (fp == NULL) {
@@ -401,33 +476,6 @@ void sendResponse(char* absURL, int* clientfd, int blocked) {
     close(*clientfd);
 
     printf("Blocked/Cached response is sent to clent, connection is now closed\n");       // REMOVEME
-}
-
-// Keep forwarding bytes from source fd to destination fd
-void* tunnel(void* args) {
-    struct sdPair * sd = args;
-    int sourcefd = sd->sourcefd;
-    int destinfd = sd->destinfd;
-
-    char buffer[BUFF_LENTH] = {0};
-    size_t bytesRead = 0;
-
-    printf("Begin tunneling\n");
-    while (1) {
-        memset(&buffer, 0, sizeof(buffer));
-
-        bytesRead = read(sourcefd, &buffer, sizeof(buffer));  // Read from source
-
-        if (bytesRead <= 0) {
-            pthread_exit(NULL);
-        }
-
-        printf("Read: Source [%zu]\n", bytesRead);       // REMOVEME
-
-        write(destinfd, buffer, bytesRead);  // Write to destination
-
-        printf("Bytes written to destination\n");       // REMOVEME
-    }
 }
 
 // Close the fd and exit the current thread
@@ -517,7 +565,7 @@ void* handle(void* args) {
             }
         }
 
-        if (sendRequest(host, absURL, request, &clientfd) != 0) {
+        if (handleForwarding(host, absURL, request, &clientfd) != 0) {
             terminate(&clientfd, NULL);
         }
 
@@ -539,7 +587,7 @@ void* handle(void* args) {
 
         int serverfd;
         char buffer[BUFF_LENTH] = {0};
-        size_t bytesRead = 0;
+        int bytesRead = 0;
         char port[PORT_LENTH] = {0};
 
         getInfo(recv, host, port);
@@ -569,10 +617,6 @@ void* handle(void* args) {
         backward.sourcefd = serverfd;
         backward.destinfd = clientfd;
         pthread_t serverToClient;
-
-        // Data pipelining. Read subsequent request from client and write to server
-        bytesRead = read(clientfd, buffer, sizeof(buffer));
-        write(serverfd, buffer, bytesRead);
 
         char* msg = "HTTP/1.1 200 Connection Established\r\n\r\n";
         snprintf(buffer, sizeof(buffer), msg);
