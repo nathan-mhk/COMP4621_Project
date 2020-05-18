@@ -11,7 +11,7 @@
 #define SERVER_PORT 12345
 #define LISTENNQ 5
 #define HTTP_HEADER_LAST_CHAR_NUM 4
-#define MAXTHREAD (10)
+#define MAXTHREAD (20)
 #define BLOCK_LIST_SIZE 10
 #define CACHE_LIST_SIZE 512
 #define URL_LENGTH 50
@@ -20,6 +20,11 @@
 #define BUFF_LENTH 16384
 #define SMALL_BUFF_LEN 1024
 #define PORT_LENTH 100
+
+struct sdPair {
+    int sourcefd;
+    int destinfd;
+};
 
 // The file should be provided from Windows, each line is terminated with \r\n
 int getBlockList(char list[BLOCK_LIST_SIZE][URL_LENGTH]) {
@@ -67,6 +72,7 @@ int getCacheList(char list[CACHE_LIST_SIZE][ABS_URL_LENGTH]) {
     return i;
 }
 
+// Convert ABS URL into relative URL. Store the corresponding host and ABS URL
 void modify(char* host, char* recv, char* request, char* absURL) {
     /**
      * i always point at the location of the next char to copy in request[]
@@ -129,7 +135,7 @@ void modify(char* host, char* recv, char* request, char* absURL) {
     while (1) {
 
         // Get to the end of the line
-        for (k; k < BUFF_LENTH; ++k) {
+        for (; k < BUFF_LENTH; ++k) {
             if (recv[k] == '\n') {
                 break;
             }
@@ -164,6 +170,7 @@ void modify(char* host, char* recv, char* request, char* absURL) {
     }
 }
 
+// Get the host and port number
 void getInfo(char* recv, char* host, char* port) {
     int i = 0;
     while (recv[i++] != ' ') {}
@@ -196,6 +203,7 @@ void getInfo(char* recv, char* host, char* port) {
 
 }
 
+// Connect to the specified host and port number
 int connectHost(char* host, int* serverfd, char* port) {
     struct addrinfo hints;
     struct addrinfo *result, *current;
@@ -225,7 +233,7 @@ int connectHost(char* host, int* serverfd, char* port) {
     }
 
     if (current == NULL) {
-        printf("Error: Could not connect\n");
+        printf("Error: No address succeeded\n");
         return -2;
     }
     freeaddrinfo(result);
@@ -234,6 +242,7 @@ int connectHost(char* host, int* serverfd, char* port) {
     return 0;
 }
 
+// Get the content length from header in msg
 long getContentLength(char* msg, int* found) {
     long contentlen = 1;
 
@@ -394,6 +403,44 @@ void sendResponse(char* absURL, int* clientfd, int blocked) {
     printf("Blocked/Cached response is sent to clent, connection is now closed\n");       // REMOVEME
 }
 
+// Keep forwarding bytes from source fd to destination fd
+void* tunnel(void* args) {
+    struct sdPair * sd = args;
+    int sourcefd = sd->sourcefd;
+    int destinfd = sd->destinfd;
+
+    char buffer[BUFF_LENTH] = {0};
+    size_t bytesRead = 0;
+
+    printf("Begin tunneling\n");
+    while (1) {
+        memset(&buffer, 0, sizeof(buffer));
+
+        bytesRead = read(sourcefd, &buffer, sizeof(buffer));  // Read from source
+
+        if (bytesRead <= 0) {
+            pthread_exit(NULL);
+        }
+
+        printf("Read: Source [%zu]\n", bytesRead);       // REMOVEME
+
+        write(destinfd, buffer, bytesRead);  // Write to destination
+
+        printf("Bytes written to destination\n");       // REMOVEME
+    }
+}
+
+// Close the fd and exit the current thread
+void terminate(int* clientfd, int* serverfd) {
+    if (clientfd != NULL) {
+        close(*clientfd);
+    }
+    if (serverfd != NULL) {
+        close(*serverfd);
+    }
+    pthread_exit(NULL);
+}
+
 void* handle(void* args) {
     int clientfd = (int) args;
 
@@ -437,7 +484,7 @@ void* handle(void* args) {
     FILE* history = fopen("history.txt", "a");
     if (history == NULL) {
         printf("Error: Failed to create file\n");
-        return 0;
+        terminate(&clientfd, NULL);
     }
 
     // recv contains the request
@@ -457,7 +504,7 @@ void* handle(void* args) {
                 printf("Requested site is blocked\n");
 
                 sendResponse(NULL, &clientfd, 1);
-                return;
+                terminate(&clientfd, NULL);
             }
         }
 
@@ -466,12 +513,12 @@ void* handle(void* args) {
                 printf("Requested URL is found in cache\n");
 
                 sendResponse(absURL, &clientfd, 0);
-                return;
+                terminate(&clientfd, NULL);
             }
         }
 
         if (sendRequest(host, absURL, request, &clientfd) != 0) {
-            return;
+            terminate(&clientfd, NULL);
         }
 
         numCachedItms = getCacheList(cacheList);
@@ -491,10 +538,8 @@ void* handle(void* args) {
         printf("HTTPS request received\n");  // REMOVEME
 
         int serverfd;
-        char cBuffer[BUFF_LENTH] = {0};
-        char sBuffer[BUFF_LENTH] = {0};
-        size_t cBytesRead = 0;
-        size_t sBytesRead = 0;
+        char buffer[BUFF_LENTH] = {0};
+        size_t bytesRead = 0;
         char port[PORT_LENTH] = {0};
 
         getInfo(recv, host, port);
@@ -507,47 +552,52 @@ void* handle(void* args) {
                 printf("Requested site is blocked\n");
 
                 sendResponse(NULL, &clientfd, 1);
-                return;
+                terminate(&clientfd, NULL);
             }
         }
 
         if (connectHost(host, &serverfd, port) != 0) {
-            return;
+            terminate(&clientfd, NULL);
         }
 
-        // Data pipelining
-        cBytesRead = read(clientfd, cBuffer, sizeof(cBuffer));
-        write(serverfd, cBuffer, cBytesRead);
+        struct sdPair forward;
+        forward.sourcefd = clientfd;
+        forward.destinfd = serverfd;
+        pthread_t clientToServer;
+
+        struct sdPair backward;
+        backward.sourcefd = serverfd;
+        backward.destinfd = clientfd;
+        pthread_t serverToClient;
+
+        // Data pipelining. Read subsequent request from client and write to server
+        bytesRead = read(clientfd, buffer, sizeof(buffer));
+        write(serverfd, buffer, bytesRead);
 
         char* msg = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        snprintf(sBuffer, sizeof(sBuffer), msg);
-        write(clientfd, sBuffer, strlen(sBuffer));    // Send confirmation back to client
+        snprintf(buffer, sizeof(buffer), msg);
+        write(clientfd, buffer, strlen(buffer));    // Send confirmation back to client
 
-
-        printf("Begin tunneling\n");
-        while (1) {
-            memset(&cBuffer, 0, sizeof(cBuffer));
-            memset(&sBuffer, 0, sizeof(sBuffer));
-
-            cBytesRead = read(clientfd, &cBuffer, sizeof(cBuffer));   // Read from client
-            sBytesRead = read(serverfd, &sBuffer, sizeof(sBuffer));   // Read from server
-
-            printf("Read: Client [%d] | Server [%d]\n", cBytesRead, sBytesRead);
-
-            if ((cBytesRead <= 0) && (sBytesRead <= 0)) {
-                break;
-            }
-
-            write(clientfd, sBuffer, sBytesRead);     // Write to client
-            write(serverfd, cBuffer, cBytesRead);     // Write to server
-
-            printf("Bytes written back\n");
+        if (pthread_create(&clientToServer, NULL, tunnel, (void*) &forward) != 0) {
+            printf("Failed to create forward tunneling thread\n");
+            terminate(&clientfd, &serverfd);
         }
+
+        if (pthread_create(&serverToClient, NULL, tunnel, (void*) &backward) != 0) {
+            printf("Failed to create backward tunneling thread\n");
+            pthread_join(clientToServer, NULL);
+            terminate(&clientfd, &serverfd);
+        }
+
+        pthread_join(clientToServer, NULL);
+        pthread_join(serverToClient, NULL);
 
         close(clientfd);
         close(serverfd);
+
         printf("HTTPS connection closed\n");
     }
+    pthread_exit(NULL);
 }
 
 int main(int argc, char** argv) {
