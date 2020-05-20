@@ -389,6 +389,8 @@ void* handleBackward(void* args) {
         pthread_exit(NULL);
     }
 
+    printf("Begin reading response\n");
+
     // Read server response
     char buffer[BUFF_LENTH] = {0};
     int bytesRead = 0, found = 0;
@@ -396,6 +398,8 @@ void* handleBackward(void* args) {
     while (remainContentLen <= 0) {
         memset(&buffer, 0, sizeof(buffer));
         bytesRead = read(serverfd, buffer, (sizeof(buffer) - 1));
+
+        printf("%d bytes read from host\n", bytesRead);
 
         if (bytesRead <= 0) {
             break;
@@ -421,6 +425,7 @@ void* handleBackward(void* args) {
         fprintf(fp, buffer);
         fflush(fp);
         write(clientfd, buffer, sizeof(buffer));
+        printf("%ld bytes remain to read (-ve means 0)\n", remainContentLen);
     }
     fclose(fp);
     pthread_exit(NULL);
